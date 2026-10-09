@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Head-Tracked Space Shooter</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        #game-container { position: relative; width: 100vw; height: 100vh; }
+        canvas { display: block; } /* Hide the raw video feed, we only need its data */
+        #input_video { position: absolute; top: 0; left: 0; opacity: 0; pointer-events: none; }
+        #ui {
+            position: absolute; top: 10px; left: 10px; color: white; z-index: 10;
+            text-shadow: 1px 1px 2px black;
+        }
+        #status { color: #FFFF00; font-size: 14px; margin-top: 5px;}
+        #game-over {
+            display: none; position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%); color: white; text-align: center; z-index: 20;
+        }
+        button { padding: 10px 20px; font-size: 18px; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <div id="ui">
+        <div>Score: <span id="score-el">0</span></div>
+        <div id="status">Initializing Camera... (Use Arrow Keys if camera fails)</div>
+    </div>
+    <div id="game-over">
+        <h1>GAME OVER</h1>
+        <button onclick="resetGame()">Restart</button>
+    </div>
+    <video id="input_video"></video>
+    <canvas id="game_canvas"></canvas>
+</div>
+
+<script>
+    // ===========================
+    // 1. Setup & Initialization
+    // ===========================
+    const canvas = document.getElementById('game_canvas');
+    const ctx = canvas.getContext('2d');
+    const scoreEl = document.getElementById('score-el');
+    const statusEl = document.getElementById('status');
+    const gameOverEl = document.getElementById('game-over');
+    const videoElement = document.getElementById('input_video');
+
+    let screenW, screenH;
+
+    function resize() {
+        screenW = window.innerWidth;
+        screenH = window.innerHeight;
+        canvas.width = screenW;
+        canvas.height = screenH;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // Game State
+    let gameState = 'playing'; // 'playing' or 'gameOver'
+    let score = 0;
+    let frameCount = 0;
+    let useCamera = false;
+
+    // ===========================
+    // 2. Game Objects
+    // ===========================
+    
+    const player = {
+        x: screenW / 2,
+        y: screenH - 50,
+        w: 40,
+        h: 40,
+        color: '#00F7FF',
+        speed: 8, // Only used for keyboard control
+        dx: 0, dy: 0 // Velocity for keyboard control
+    };
+
+    let bullets = [];
+    let enemies = [];
+    let stars = [];
+
+    // Initialize stars for background
+    for (let i = 0; i < 100; i++) {
+        stars.push({
+            x: Math.random() * screenW,
+            y: Math.random() * screenH,
+            size: Math.random() * 2,
+            speed: Math.random() * 3 + 1
+        });
+    }
+
+    // ===========================
+    // 3. Controls & Tracking Logic
+    // ===========================
+
+    // --- Head Tracking Variables ---
+    // Target positions represent where the player *wants* to go based on input
+    let targetX = player.x;
+    let targetY = player.y;
+    
+    // Smoothing factor (0.0 to 1.0). Lower = smoother but more lag caused by "weight".
+    const LERP_FACTOR = 0.15; 
+
+    // Mapping configuration: How much head movement translates to screen movement.
+    // Represents the "dead zone" center percentage of the camera frame.
+    const MOVEMENT_THRESHOLD = 0.02; 
+    // Multiplier to amplify small head movements to cover the whole screen.
+    const SENSITIVITY = 3.0; 
+
+
+    function onFaceMeshResults(results) {
+        if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) return;
+
+        useCamera = true;
+        statusEl.innerText = "Tracking Active: Moving head controls ship.";
+
+        const landmarks = results.multiFaceLandmarks[0];
+        // Landmark 1 represents the tip of the nose.
+        // MediaPipe gives normalized coordinates (0.0 to 1.0).
+        const nose = landmarks[1]; 
+
+        // --- MAPPING LOGIC EXPLAINED ---
+        // 1. The center of the camera view is (0.5, 0.5).
+        // 2. We calculate how far the nose is from the center relative to the threshold.
+        // 3. If nose.x is < 0.48 (moved left), deltaX becomes negative.
+        // 4. If nose.x is > 0.52 (moved right), deltaX becomes positive.
+        let deltaX = 0;
+        let deltaY = 0;
+
+        if (nose.x < 0.5 - MOVEMENT_THRESHOLD) deltaX = (nose.x - (0.5 - MOVEMENT_THRESHOLD));
+        if (nose.x > 0.5 + MOVEMENT_THRESHOLD) deltaX = (nose.x - (0.5 + MOVEMENT_THRESHOLD));
+        
+        // Note: MediaPipe Y is top-to-bottom (0 is top), which matches Canvas Y.
+        if (nose.y < 0.5 - MOVEMENT_THRESHOLD) deltaY = (nose.y - (0.5 - MOVEMENT_THRESHOLD));
+        if (nose.y > 0.5 + MOVEMENT_THRESHOLD) deltaY = (nose.y - (0.5 + MOVEMENT_THRESHOLD));
+
+        // Calculate target position based on displacement, sensitivity, and screen size.
+        // We invert deltaX because webcam view is usually mirrored horizontally.
+        targetX = (screenW / 2) + (-deltaX * SENSITIVITY * screenW);
+        targetY = (screenH / 2) + (deltaY * SENSITIVITY * screenH);
+
+        // Clamp targets to screen bounds
+        targetX = Math.max(player.w/2, Math.min(screenW - player.w/2, targetX));
+        targetY = Math.max(player.h/2, Math.min(screenH - player.h/2, targetY));
+    }
+
+    // --- Keyboard Fallback ---
+    window.addEventListener('keydown', (e) => {
+        if(useCamera) return; // Priority to camera if active
+        statusEl.innerText = "Keyboard Control Active";
+        if(e.key === 'ArrowLeft') player.dx = -player.speed;
+        if(e.key === 'ArrowRight') player.dx = player.speed;
+        if(e.key === 'ArrowUp') player.dy = -player.speed;
+        if(e.key === 'ArrowDown') player.dy = player.speed;
+    });
+    window.addEventListener('keyup', (e) => {
+        if(useCamera) return;
+        if(e.key === 'ArrowLeft' || e.key === 'ArrowRight') player.dx = 0;
+        if(e.key === 'ArrowUp' || e.key === 'ArrowDown') player.dy = 0;
+    });
+
+
+    // ===========================
+    // 4. Game Loop Functions
+    // ===========================
+
+    function spawnEnemy() {
+        // Increase spawn rate slightly over time
+        const spawnChance = 0.02 + (score / 5000); 
+        if (Math.random() < spawnChance) {
+            enemies.push({
+                x: Math.random() * (screenW - 30),
+                y: -30,
+                w: 30, h: 30,
+                color: '#FF3333',
+                speed: Math.random() * 3 + 2 + (score / 500)
+            });
+        }
+    }
+
+    // Simple Axis-Aligned Bounding Box collision
+    function rectCollision(rect1, rect2) {
+        return (
+            rect1.x < rect2.x + rect2.w &&
+            rect1.x + rect1.w > rect2.x &&
+            rect1.y < rect2.y + rect2.h &&
+            rect1.y + rect1.h > rect2.y
+        );
+    }
+
+    function update() {
+        if (gameState !== 'playing') return;
+
+        frameCount++;
+
+        // --- Player Movement ---
+        if (useCamera) {
+             // SMOOTHING APPLIED HERE
+             // Move current position a percentage (LERP_FACTOR) towards target position
+            player.x += (targetX - player.x) * LERP_FACTOR;
+            player.y += (targetY - player.y) * LERP_FACTOR;
+        } else {
+            // Keyboard movement
+            player.x += player.dx;
+            player.y += player.dy;
+             // Clamp keyboard movement
+            player.x = Math.max(0, Math.min(screenW - player.w, player.x));
+            player.y = Math.max(0, Math.min(screenH - player.h, player.y));
+        }
+
+        // --- Auto Shooting ---
+        if (frameCount % 15 === 0) { // Shoot every 15 frames
+            bullets.push({
+                x: player.x + player.w / 2 - 2.5, // Center bullet
+                y: player.y,
+                w: 5, h: 15,
+                color: '#FFFF00',
+                speed: 10
+            });
+        }
+
+        // Move & Manage Bullets
+        for (let i = bullets.length - 1; i >= 0; i--) {
+            bullets[i].y -= bullets[i].speed;
+            if (bullets[i].y + bullets[i].h < 0) bullets.splice(i, 1);
+        }
+
+        // Move & Manage Enemies
+        spawnEnemy();
+        for (let i = enemies.length - 1; i >= 0; i--) {
+            enemies[i].y += enemies[i].speed;
+            
+            // Check collision with player
+            if (rectCollision(enemies[i], player)) {
+                endGame();
+            }
+
+            // Check collision with bullets
+            for (let j = bullets.length - 1; j >= 0; j--) {
+                if (bullets[j] && rectCollision(enemies[i], bullets[j])) {
+                    score += 10;
+                    scoreEl.innerText = score;
+                    enemies.splice(i, 1);
+                    bullets.splice(j, 1);
+                    // Enemy removed, break inner loop to avoid error checking same enemy
+                    break; 
+                }
+            }
+            // Remove off-screen enemies
+            if (enemies[i] && enemies[i].y > screenH) {
+                 enemies.splice(i, 1);
+            }
+        }
+
+        // Background stars
+        stars.forEach(star => {
+            star.y += star.speed;
+            if (star.y > screenH) star.y = 0;
+        });
+    }
+
+    function draw() {
+        // Clear screen
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, screenW, screenH);
+
+        // Draw Stars
+        ctx.fillStyle = '#FFF';
+        stars.forEach(star => {
+            ctx.beginPath();
+            ctx.arc(star.x, star.y, star.size, 0, Math.PI*2);
+            ctx.fill();
+        });
+
+        if (gameState !== 'playing') return;
+
+        // Draw Player (Simple Triangle representation)
+        ctx.fillStyle = player.color;
+        ctx.beginPath();
+        ctx.moveTo(player.x + player.w / 2, player.y); // Top center
+        ctx.lineTo(player.x, player.y + player.h); // Bottom left
+        ctx.lineTo(player.x + player.w, player.y + player.h); // Bottom right
+        ctx.closePath();
+        ctx.fill();
+
+        // Draw Bullets
+        bullets.forEach(b => {
+            ctx.fillStyle = b.color;
+            ctx.fillRect(b.x, b.y, b.w, b.h);
+        });
+
+        // Draw Enemies
+        enemies.forEach(e => {
+            ctx.fillStyle = e.color;
+            ctx.fillRect(e.x, e.y, e.w, e.h);
+            // Draw simple eyes to show orientation
+             ctx.fillStyle = 'black';
+             ctx.fillRect(e.x + 5, e.y + 15, 5, 5);
+             ctx.fillRect(e.x + e.w - 10, e.y + 15, 5, 5);
+        });
+    }
+
+    function endGame() {
+        gameState = 'gameOver';
+        gameOverEl.style.display = 'block';
+    }
+
+    window.resetGame = function() {
+        score = 0;
+        scoreEl.innerText = 0;
+        enemies = [];
+        bullets = [];
+        player.x = screenW / 2;
+        player.y = screenH - 100;
+        // Reset tracking targets too so you don't instantly die again
+        targetX = player.x;
+        targetY = player.y;
+        gameState = 'playing';
+        gameOverEl.style.display = 'none';
+    }
+
+    function gameLoop() {
+        update();
+        draw();
+        requestAnimationFrame(gameLoop);
+    }
+
+    // ===========================
+    // 5. MediaPipe Initialization
+    // ===========================
+    const faceMesh = new FaceMesh({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+    }});
+    
+    // Optimization settings for faster, albeit slightly less accurate, tracking
+    faceMesh.setOptions({
+        maxNumFaces: 1,
+        refineLandmarks: false, 
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+    faceMesh.onResults(onFaceMeshResults);
+
+    // Start Camera
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            await faceMesh.send({image: videoElement});
+        },
+        width: 640, // Processing resolution (lower = faster)
+        height: 480
+    });
+    
+    camera.start()
+    .then(() => {
+        // Camera started successfully
+    })
+    .catch(err => {
+        statusEl.innerText = "Camera access denied. Using Keyboard controls.";
+        console.error("Camera failed: ", err);
+    });
+
+    // Start game loop immediately
+    gameLoop();
+
+</script>
+</body>
+</html>
